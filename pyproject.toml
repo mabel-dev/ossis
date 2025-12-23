@@ -25,7 +25,7 @@ classifiers = [
 keywords = ["schema", "data", "validation", "types"]
 requires-python = ">=3.8"
 dependencies = [
-    "data-expectations>=1.6.0",
+    "data-expectations>=1.7.0",
     "orjson",
     "numpy",
     "pyarrow",
