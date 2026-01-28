@@ -23,7 +23,10 @@ from warnings import warn
 
 import orjson
 
-from .tools import parse_iso
+from ossis.compute import parse_float16
+from ossis.compute import parse_float32
+from ossis.compute import parse_float64
+from ossis.tools import parse_iso
 
 
 def _parse_type(type_str: str) -> Union[str, Tuple[str, Tuple[int, ...]]]:
@@ -56,33 +59,106 @@ def _parse_type(type_str: str) -> Union[str, Tuple[str, Tuple[int, ...]]]:
         length = int(varchar_match.group(1))
         return "VARCHAR", (length,)
 
-    # Match BLOB[n]
+    # Match VARBINARY[n]
+    varbinary_match = re.match(r"VARBINARY\[(\d+)\]", type_str)
+    if varbinary_match:
+        size = int(varbinary_match.group(1))
+        return "VARBINARY", (size,)
+
+    # Match BLOB[n] (deprecated alias for VARBINARY)
     blob_match = re.match(r"BLOB\[(\d+)\]", type_str)
     if blob_match:
         size = int(blob_match.group(1))
-        return "BLOB", (size,)
+        warn("Column type BLOB is deprecated; treating as VARBINARY. Use VARBINARY instead.")
+        return "VARBINARY", (size,)
 
     # If no parameters, return base type as a string
     return type_str.upper()
 
 
-class OrsoTypes(str, Enum):
+def get_ossis_type(type_str: str) -> "ossisTypes":
     """
-    The names of the types supported by Orso
+    Convert a type string to an ossisType enum value with full type information.
+
+    This function parses a type string and returns an ossisType enum value with
+    all relevant attributes set (precision, scale, length, element types).
+
+    Parameters:
+        type_str (str): The type definition string (e.g., 'INTEGER', 'ARRAY<INTEGER>', 'DECIMAL(10,2)').
+
+    Returns:
+        ossisTypes: The corresponding ossisType enum value with all attributes properly set.
+
+    Raises:
+        ValueError: If the type string is not recognized.
+
+    Examples:
+        >>> t = get_ossis_type("INTEGER")
+        >>> t == ossisTypes.INTEGER
+        True
+
+        >>> t = get_ossis_type("DECIMAL(10,2)")
+        >>> t._precision
+        10
+        >>> t._scale
+        2
+
+        >>> t = get_ossis_type("VARCHAR[255]")
+        >>> t._length
+        255
+
+        >>> t = get_ossis_type("ARRAY<INTEGER>")
+        >>> t._element_type == ossisTypes.INTEGER
+        True
+    """
+    if not type_str:
+        raise ValueError("Type string cannot be empty")
+
+    # Use the existing from_name method which handles all type attributes
+    _type, _length, _precision, _scale, _element_type = ossisTypes.from_name(type_str)
+
+    if _type == 0 or _type is None:
+        raise ValueError(f"Unknown type '{type_str}'")
+
+    # Attach all the metadata to the returned type instance
+    # The __init__ method initializes these as None, so we just update them
+    object.__setattr__(_type, "_length", _length)
+    object.__setattr__(_type, "_precision", _precision)
+    object.__setattr__(_type, "_scale", _scale)
+    object.__setattr__(_type, "_element_type", _element_type)
+
+    return _type
+
+
+class ossisTypes(str, Enum):
+    """
+    The names of the types supported by ossis
     """
 
     ARRAY = "ARRAY"
-    BLOB = "BLOB"
+    BLOB = "BLOB"  # deprecated; use VARBINARY
     BOOLEAN = "BOOLEAN"
     DATE = "DATE"
     DECIMAL = "DECIMAL"
-    DOUBLE = "DOUBLE"
-    INTEGER = "INTEGER"
+    DOUBLE = "DOUBLE"  # mark as deprecated, use FLOAT64
+    FLOAT16 = "FLOAT16"  # new
+    FLOAT32 = "FLOAT32"  # new
+    FLOAT64 = "FLOAT64"  # new
+    INTEGER = "INTEGER"  # mark as deprecated (sized ints)
+    INT8 = "INT8"  # new
+    UINT8 = "UINT8"  # new
+    INT16 = "INT16"  # new
+    UINT16 = "UINT16"  # new
+    INT32 = "INT32"  # new
+    UINT32 = "UINT32"  # new
+    INT64 = "INT64"  # new
+    UINT64 = "UINT64"  # new
     INTERVAL = "INTERVAL"
-    STRUCT = "STRUCT"
+    STRUCT = "STRUCT"  # mark as deprecated, use JSONB
     TIMESTAMP = "TIMESTAMP"
     TIME = "TIME"
     VARCHAR = "VARCHAR"
+    VARBINARY = "VARBINARY"  # new
     NULL = "NULL"
     JSONB = "JSONB"
     _MISSING_TYPE = 0
@@ -90,7 +166,7 @@ class OrsoTypes(str, Enum):
     def __init__(self, *args, **kwargs):
         self._precision: int = None
         self._scale: int = None
-        self._element_type: "OrsoTypes" = None
+        self._element_type: "ossisTypes" = None
         self._length: int = None
 
         str.__init__(self)
@@ -98,7 +174,23 @@ class OrsoTypes(str, Enum):
 
     def is_numeric(self):
         """is the typle number-based"""
-        return self in (self.INTEGER, self.DOUBLE, self.DECIMAL, self.BOOLEAN)
+        return self in (
+            self.INTEGER,
+            self.DOUBLE,
+            self.DECIMAL,
+            self.BOOLEAN,
+            self.INT8,
+            self.UINT8,
+            self.INT16,
+            self.UINT16,
+            self.INT32,
+            self.UINT32,
+            self.INT64,
+            self.UINT64,
+            self.FLOAT16,
+            self.FLOAT32,
+            self.FLOAT64,
+        )
 
     def is_temporal(self):
         """is the type time-based"""
@@ -106,7 +198,7 @@ class OrsoTypes(str, Enum):
 
     def is_large_object(self):
         """is the type arbitrary length string"""
-        return self in (self.VARCHAR, self.BLOB)
+        return self in (self.VARCHAR, self.BLOB, self.VARBINARY)
 
     def is_complex(self):
         return self in (self.ARRAY, self.STRUCT, self.JSONB, self.INTERVAL)
@@ -118,8 +210,8 @@ class OrsoTypes(str, Enum):
             return f"DECIMAL({self._precision}, {self._scale})"
         if self.value == self.VARCHAR and self._length is not None:
             return f"VARCHAR[{self._length}]"
-        if self.value == self.BLOB and self._length is not None:
-            return f"BLOB[{self._length}]"
+        if self.value in (self.BLOB, self.VARBINARY) and self._length is not None:
+            return f"VARBINARY[{self._length}]"
         return self.value
 
     def parse(self, value: Any, **kwargs) -> Any:
@@ -130,32 +222,109 @@ class OrsoTypes(str, Enum):
 
         if value is None:
             return None
-        return ORSO_TO_PYTHON_PARSER[self.value](value, **kwargs)
+        return ossis_TO_PYTHON_PARSER[self.value](value, **kwargs)
 
     @property
     def python_type(self) -> Type:
-        return ORSO_TO_PYTHON_MAP.get(self)
+        return ossis_TO_PYTHON_MAP.get(self)
 
     @property
     def numpy_dtype(self):
         import numpy
 
         MAP = {
-            OrsoTypes.ARRAY: numpy.dtype("O"),
-            OrsoTypes.BLOB: numpy.dtype("S"),
-            OrsoTypes.BOOLEAN: numpy.dtype("?"),
-            OrsoTypes.DATE: numpy.dtype("datetime64[D]"),  # [2.5e16 BC, 2.5e16 AD]
-            OrsoTypes.DECIMAL: numpy.dtype("O"),
-            OrsoTypes.DOUBLE: numpy.dtype("float64"),
-            OrsoTypes.INTEGER: numpy.dtype("int64"),
-            OrsoTypes.INTERVAL: numpy.dtype("m"),
-            OrsoTypes.STRUCT: numpy.dtype("O"),
-            OrsoTypes.TIMESTAMP: numpy.dtype("datetime64[us]"),  # [290301 BC, 294241 AD]
-            OrsoTypes.TIME: numpy.dtype("O"),
-            OrsoTypes.VARCHAR: numpy.dtype("U"),
-            OrsoTypes.NULL: numpy.dtype("O"),
+            ossisTypes.ARRAY: numpy.dtype("O"),
+            ossisTypes.BLOB: numpy.dtype("S"),
+            ossisTypes.VARBINARY: numpy.dtype("S"),
+            ossisTypes.BOOLEAN: numpy.dtype("?"),
+            ossisTypes.DATE: numpy.dtype("datetime64[D]"),  # [2.5e16 BC, 2.5e16 AD]
+            ossisTypes.DECIMAL: numpy.dtype("O"),
+            ossisTypes.DOUBLE: numpy.dtype("float64"),
+            ossisTypes.FLOAT16: numpy.dtype("float16"),
+            ossisTypes.FLOAT32: numpy.dtype("float32"),
+            ossisTypes.FLOAT64: numpy.dtype("float64"),
+            ossisTypes.INTEGER: numpy.dtype("int64"),
+            ossisTypes.INT8: numpy.dtype("int8"),
+            ossisTypes.UINT8: numpy.dtype("uint8"),
+            ossisTypes.INT16: numpy.dtype("int16"),
+            ossisTypes.UINT16: numpy.dtype("uint16"),
+            ossisTypes.INT32: numpy.dtype("int32"),
+            ossisTypes.UINT32: numpy.dtype("uint32"),
+            ossisTypes.INT64: numpy.dtype("int64"),
+            ossisTypes.UINT64: numpy.dtype("uint64"),
+            ossisTypes.INTERVAL: numpy.dtype("m"),
+            ossisTypes.STRUCT: numpy.dtype("O"),
+            ossisTypes.TIMESTAMP: numpy.dtype("datetime64[us]"),  # [290301 BC, 294241 AD]
+            ossisTypes.TIME: numpy.dtype("O"),
+            ossisTypes.VARCHAR: numpy.dtype("U"),
+            ossisTypes.NULL: numpy.dtype("O"),
         }
         return MAP.get(self)
+
+    def to_arrow(
+        self, *, element_type: "ossisTypes" = None, precision: int = None, scale: int = None
+    ):
+        """
+        Return a pyarrow DataType corresponding to this ossisType.
+
+        Parameters:
+            element_type: Optional[ossisTypes] - element type for ARRAY overrides
+            precision: Optional[int] - precision override for DECIMAL
+            scale: Optional[int] - scale override for DECIMAL
+        """
+        from decimal import getcontext as _getcontext
+
+        import pyarrow as pa
+
+        _precision = (
+            precision
+            if precision is not None
+            else (self._precision if self._precision is not None else _getcontext().prec)
+        )
+        _scale = scale if scale is not None else (self._scale if self._scale is not None else 10)
+
+        type_map = {
+            ossisTypes.BOOLEAN: pa.bool_(),
+            ossisTypes.BLOB: pa.binary(),
+            ossisTypes.VARBINARY: pa.binary(),
+            ossisTypes.DATE: pa.date64(),
+            ossisTypes.TIMESTAMP: pa.timestamp("us"),
+            ossisTypes.TIME: pa.time32("ms"),
+            ossisTypes.INTERVAL: pa.month_day_nano_interval(),
+            ossisTypes.DECIMAL: pa.decimal128(_precision, _scale),
+            ossisTypes.DOUBLE: pa.float64(),
+            ossisTypes.INTEGER: pa.int64(),
+            ossisTypes.INT8: pa.int8(),
+            ossisTypes.UINT8: pa.uint8(),
+            ossisTypes.INT16: pa.int16(),
+            ossisTypes.UINT16: pa.uint16(),
+            ossisTypes.INT32: pa.int32(),
+            ossisTypes.UINT32: pa.uint32(),
+            ossisTypes.INT64: pa.int64(),
+            ossisTypes.UINT64: pa.uint64(),
+            ossisTypes.FLOAT16: pa.float16(),
+            ossisTypes.FLOAT32: pa.float32(),
+            ossisTypes.FLOAT64: pa.float64(),
+            ossisTypes.VARCHAR: pa.string(),
+            ossisTypes.JSONB: pa.binary(),
+            ossisTypes.NULL: pa.null(),
+        }
+
+        if self == ossisTypes.ARRAY:
+            elem = element_type or self._element_type or ossisTypes.VARCHAR
+            if isinstance(elem, ossisTypes):
+                elem_pa_type = elem.to_arrow()
+            elif isinstance(elem, str) and elem in ossisTypes.__members__:
+                elem_pa_type = ossisTypes[elem].to_arrow()
+            else:
+                elem_pa_type = pa.string()
+            return pa.list_(elem_pa_type)
+
+        # For STRUCT we don't have child field information here; return binary as a sensible fallback.
+        if self == ossisTypes.STRUCT:
+            return pa.binary()
+
+        return type_map.get(self, pa.string())
 
     @staticmethod
     def from_name(name: str) -> tuple:
@@ -165,30 +334,31 @@ class OrsoTypes(str, Enum):
         _element_type = None
 
         if name is None:
-            return (OrsoTypes._MISSING_TYPE, _length, _precision, _scale, _element_type)
+            return (ossisTypes._MISSING_TYPE, _length, _precision, _scale, _element_type)
 
         type_name = str(name).upper()
         parsed_types = _parse_type(type_name)
         if isinstance(parsed_types, str):
             if parsed_types == "ARRAY":
                 warn("Column type ARRAY without element_type, defaulting to VARCHAR.")
-                _type = OrsoTypes.ARRAY
-                _element_type = OrsoTypes.VARCHAR
-            elif parsed_types in OrsoTypes.__members__:
-                _type = OrsoTypes[parsed_types]
-            elif parsed_types == "LIST":
-                warn("Column type LIST will be deprecated in a future version, use ARRAY instead.")
-                _type = OrsoTypes.ARRAY
-            elif parsed_types == "NUMERIC":
-                warn(
-                    "Column type NUMERIC will be deprecated in a future version, use DECIMAL, DOUBLE or INTEGER instead. Mapped to DOUBLE, this may not be compatible with all values NUMERIC was compatible with."
-                )
-                _type = OrsoTypes.DOUBLE
-            elif parsed_types == "BSON":
-                warn("Column type BSON will be deprecated in a future version, use JSONB instead.")
-                _type = OrsoTypes.JSONB
-            elif parsed_types == "STRING":
-                raise ValueError(f"Unknown type '{_type}'. Did you mean 'VARCHAR'?")
+                _type = ossisTypes.ARRAY
+                _element_type = ossisTypes.VARCHAR
+            elif parsed_types in ("NUMERIC", "BSON", "STRUCT", "LIST"):
+                raise ValueError(f"Column type {parsed_types} is deprecated.")
+            elif parsed_types in ossisTypes.__members__:
+                _type = ossisTypes[parsed_types]
+            elif parsed_types == "VARBINARY":
+                _type = ossisTypes.VARBINARY
+            elif parsed_types == "BLOB":
+                # This branch is mostly defensive; _parse_type handles BLOB[...] already.
+                warn("Column type BLOB is deprecated; use VARBINARY instead.")
+                _type = ossisTypes.VARBINARY
+            elif parsed_types == "DOUBLE":
+                warn("Column type DOUBLE is deprecated; use FLOAT64 instead.")
+                _type = ossisTypes.FLOAT64
+            elif parsed_types == "INTEGER":
+                warn("Column type INTEGER is deprecated; use INT64 instead.")
+                _type = ossisTypes.INT64
             elif (
                 type_name == "0"
                 or type_name == 0
@@ -199,17 +369,29 @@ class OrsoTypes(str, Enum):
             else:
                 raise ValueError(f"Unknown column type '{name}''.")
         elif parsed_types[0] == "ARRAY":
-            _type = OrsoTypes.ARRAY
+            _type = ossisTypes.ARRAY
             _element_type = parsed_types[1][0]
-            if _element_type.startswith(("ARRAY", "LIST", "NUMERIC", "BSON", "STRING", "DECIMAL")):
+            if not _element_type.startswith(
+                (
+                    "INT",
+                    "UINT",
+                    "FLOAT",
+                    "VARCHAR",
+                    "VARBINARY",
+                    "BOOLEAN",
+                    "DATE",
+                    "TIMESTAMP",
+                    "TIME",
+                )
+            ):
                 raise ValueError(f"Invalid element type '{_element_type}' for ARRAY type.")
-            if _element_type in OrsoTypes.__members__:
-                _type = OrsoTypes.ARRAY
-                _element_type = OrsoTypes[_element_type]
+            if _element_type in ossisTypes.__members__:
+                _type = ossisTypes.ARRAY
+                _element_type = ossisTypes[_element_type]
             else:
                 raise ValueError(f"Unknown column type '{_element_type}'.")
         elif parsed_types[0] == "DECIMAL":
-            _type = OrsoTypes.DECIMAL
+            _type = ossisTypes.DECIMAL
             _precision, _scale = parsed_types[1]
             if _precision < 0 or _precision > 38:
                 raise ValueError(f"Invalid precision '{_precision}' for DECIMAL type.")
@@ -220,10 +402,15 @@ class OrsoTypes(str, Enum):
                     "Precision must be equal to or greater than scale for DECIMAL type."
                 )
         elif parsed_types[0] == "VARCHAR":
-            _type = OrsoTypes.VARCHAR
+            _type = ossisTypes.VARCHAR
+            _length = parsed_types[1][0]
+        elif parsed_types[0] == "VARBINARY":
+            _type = ossisTypes.VARBINARY
             _length = parsed_types[1][0]
         elif parsed_types[0] == "BLOB":
-            _type = OrsoTypes.BLOB
+            # Deprecated alias
+            warn("Column type BLOB is deprecated; use VARBINARY instead.")
+            _type = ossisTypes.VARBINARY
             _length = parsed_types[1][0]
         else:
             raise ValueError(f"Unknown column type '{_type}'.")
@@ -250,7 +437,7 @@ BOOLEAN_STRINGS = (
 
 
 def parse_decimal(value, *, precision=None, scale=None, **kwargs):
-    from .tools import DecimalFactory
+    from ossis.tools import DecimalFactory
 
     if value is None:
         return None
@@ -277,27 +464,45 @@ def parse_decimal(value, *, precision=None, scale=None, **kwargs):
     return factory(value)
 
 
-ORSO_TO_PYTHON_MAP: dict = {
-    OrsoTypes.BOOLEAN: bool,
-    OrsoTypes.BLOB: bytes,
-    OrsoTypes.DATE: datetime.date,
-    OrsoTypes.TIMESTAMP: datetime.datetime,
-    OrsoTypes.TIME: datetime.time,
-    OrsoTypes.INTERVAL: datetime.timedelta,
-    OrsoTypes.STRUCT: dict,
-    OrsoTypes.DECIMAL: decimal.Decimal,
-    OrsoTypes.DOUBLE: float,
-    OrsoTypes.INTEGER: int,
-    OrsoTypes.ARRAY: list,
-    OrsoTypes.VARCHAR: str,
-    OrsoTypes.JSONB: bytes,
-    OrsoTypes.NULL: None,
+ossis_TO_PYTHON_MAP: dict = {
+    ossisTypes.BOOLEAN: bool,
+    ossisTypes.BLOB: bytes,
+    ossisTypes.VARBINARY: bytes,
+    ossisTypes.DATE: datetime.date,
+    ossisTypes.TIMESTAMP: datetime.datetime,
+    ossisTypes.TIME: datetime.time,
+    ossisTypes.INTERVAL: datetime.timedelta,
+    ossisTypes.STRUCT: dict,
+    ossisTypes.DECIMAL: decimal.Decimal,
+    ossisTypes.DOUBLE: float,
+    ossisTypes.FLOAT16: float,
+    ossisTypes.FLOAT32: float,
+    ossisTypes.FLOAT64: float,
+    ossisTypes.INTEGER: int,
+    ossisTypes.INT8: int,
+    ossisTypes.UINT8: int,
+    ossisTypes.INT16: int,
+    ossisTypes.UINT16: int,
+    ossisTypes.INT32: int,
+    ossisTypes.UINT32: int,
+    ossisTypes.INT64: int,
+    ossisTypes.UINT64: int,
+    ossisTypes.ARRAY: list,
+    ossisTypes.VARCHAR: str,
+    ossisTypes.JSONB: bytes,
+    ossisTypes.NULL: None,
 }
 
-PYTHON_TO_ORSO_MAP: dict = {
-    value: key for key, value in ORSO_TO_PYTHON_MAP.items() if key != OrsoTypes.JSONB
+PYTHON_TO_ossis_MAP: dict = {
+    value: key for key, value in ossis_TO_PYTHON_MAP.items() if key != ossisTypes.JSONB
 }
-PYTHON_TO_ORSO_MAP.update({tuple: OrsoTypes.ARRAY, set: OrsoTypes.ARRAY})  # map other python types
+PYTHON_TO_ossis_MAP.update({tuple: ossisTypes.ARRAY, set: ossisTypes.ARRAY})  # map other python types
+
+# Prefer the generic INTEGER mapping for plain Python ints to avoid ambiguity
+# with smaller integer types like INT8/UINT8 which also map to int.
+PYTHON_TO_ossis_MAP[int] = ossisTypes.INT64
+# Prefer BLOB when mapping raw bytes -> ossisTypes (binary arrow types should become BLOB)
+PYTHON_TO_ossis_MAP[bytes] = ossisTypes.VARBINARY
 
 
 def parse_boolean(x, **kwargs):
@@ -346,12 +551,60 @@ def parse_array(x, **kwargs):
     return [parser(v) for v in x]
 
 
-def parse_double(x, **kwargs):
-    return float(x)
+def parse_int8(x, **kwargs):
+    val = int(x)
+    if val < -128 or val > 127:
+        raise ValueError(f"INT8 value out of range: {val}")
+    return val
 
 
-def parse_integer(x, **kwargs):
-    return int(x)
+def parse_uint8(x, **kwargs):
+    val = int(x)
+    if val < 0 or val > 255:
+        raise ValueError(f"UINT8 value out of range: {val}")
+    return val
+
+
+def parse_int16(x, **kwargs):
+    val = int(x)
+    if val < -32768 or val > 32767:
+        raise ValueError(f"INT16 value out of range: {val}")
+    return val
+
+
+def parse_uint16(x, **kwargs):
+    val = int(x)
+    if val < 0 or val > 65535:
+        raise ValueError(f"UINT16 value out of range: {val}")
+    return val
+
+
+def parse_int32(x, **kwargs):
+    val = int(x)
+    if val < -2147483648 or val > 2147483647:
+        raise ValueError(f"INT32 value out of range: {val}")
+    return val
+
+
+def parse_uint32(x, **kwargs):
+    val = int(x)
+    if val < 0 or val > 4294967295:
+        raise ValueError(f"UINT32 value out of range: {val}")
+    return val
+
+
+def parse_int64(x, **kwargs):
+    val = int(x)
+    if val < -9223372036854775808 or val > 9223372036854775807:
+        raise ValueError(f"INT64 value out of range: {val}")
+    return val
+
+
+def parse_uint64(x, **kwargs):
+    val = int(x)
+    if val < 0 or val > 18446744073709551615:
+        raise ValueError(f"UINT64 value out of range: {val}")
+    return val
 
 
 def parse_null(x, **kwargs):
@@ -369,42 +622,54 @@ def parse_interval(x, **kwargs):
     return datetime.timedelta(x)
 
 
-ORSO_TO_PYTHON_PARSER: dict = {
-    OrsoTypes.BOOLEAN: parse_boolean,
-    OrsoTypes.BLOB: parse_bytes,
-    OrsoTypes.DATE: parse_date,
-    OrsoTypes.TIMESTAMP: parse_timestamp,
-    OrsoTypes.TIME: parse_time,
-    OrsoTypes.INTERVAL: parse_interval,
-    OrsoTypes.STRUCT: parse_bytes,
-    OrsoTypes.DECIMAL: parse_decimal,
-    OrsoTypes.DOUBLE: parse_double,
-    OrsoTypes.INTEGER: parse_integer,
-    OrsoTypes.ARRAY: parse_array,
-    OrsoTypes.VARCHAR: parse_varchar,
-    OrsoTypes.JSONB: parse_bytes,
-    OrsoTypes.NULL: parse_null,
+ossis_TO_PYTHON_PARSER: dict = {
+    ossisTypes.BOOLEAN: parse_boolean,
+    ossisTypes.BLOB: parse_bytes,
+    ossisTypes.VARBINARY: parse_bytes,
+    ossisTypes.DATE: parse_date,
+    ossisTypes.TIMESTAMP: parse_timestamp,
+    ossisTypes.TIME: parse_time,
+    ossisTypes.INTERVAL: parse_interval,
+    ossisTypes.STRUCT: parse_bytes,
+    ossisTypes.DECIMAL: parse_decimal,
+    ossisTypes.DOUBLE: parse_float64,
+    ossisTypes.FLOAT16: parse_float16,
+    ossisTypes.FLOAT32: parse_float32,
+    ossisTypes.FLOAT64: parse_float64,
+    ossisTypes.INTEGER: parse_int64,
+    ossisTypes.INT8: parse_int8,
+    ossisTypes.UINT8: parse_uint8,
+    ossisTypes.INT16: parse_int16,
+    ossisTypes.UINT16: parse_uint16,
+    ossisTypes.INT32: parse_int32,
+    ossisTypes.UINT32: parse_uint32,
+    ossisTypes.INT64: parse_int64,
+    ossisTypes.UINT64: parse_uint64,
+    ossisTypes.ARRAY: parse_array,
+    ossisTypes.VARCHAR: parse_varchar,
+    ossisTypes.JSONB: parse_bytes,
+    ossisTypes.NULL: parse_null,
 }
 
 
-def find_compatible_type(types: Iterable[OrsoTypes], default=OrsoTypes.VARCHAR) -> OrsoTypes:
+def find_compatible_type(types: Iterable[ossisTypes], default=ossisTypes.VARCHAR) -> ossisTypes:
     """
     Find the most compatible type that can represent all input types.
 
     Parameters:
-        types (list): List of OrsoTypes to find a compatible type for
+        types (list): List of ossisTypes to find a compatible type for
 
     Returns:
-        OrsoTypes: The most compatible type that can represent all input types
+        ossisTypes: The most compatible type that can represent all input types
 
     Examples:
-        >>> OrsoTypes.find_compatible_type([OrsoTypes.INTEGER, OrsoTypes.DOUBLE])
-        OrsoTypes.DOUBLE
-        >>> OrsoTypes.find_compatible_type([OrsoTypes.BLOB, OrsoTypes.VARCHAR])
-        OrsoTypes.VARCHAR
+        >>> ossisTypes.find_compatible_type([ossisTypes.INTEGER, ossisTypes.DOUBLE])
+        ossisTypes.DOUBLE
+        >>> ossisTypes.find_compatible_type([ossisTypes.BLOB, ossisTypes.VARCHAR])
+        ossisTypes.VARCHAR
     """
     if not types:
-        return OrsoTypes.NULL
+        return ossisTypes.NULL
 
     # Handle single type case
     if len(set(types)) == 1:
@@ -413,16 +678,28 @@ def find_compatible_type(types: Iterable[OrsoTypes], default=OrsoTypes.VARCHAR) 
     # Define type promotion hierarchy
     type_hierarchy = {
         # Numeric promotion
-        OrsoTypes.BOOLEAN: 1,
-        OrsoTypes.INTEGER: 2,
-        OrsoTypes.DOUBLE: 3,
-        OrsoTypes.DECIMAL: 4,
+        ossisTypes.BOOLEAN: 1,
+        ossisTypes.INTEGER: 2,
+        ossisTypes.INT8: 2,
+        ossisTypes.UINT8: 2,
+        ossisTypes.INT16: 2,
+        ossisTypes.UINT16: 2,
+        ossisTypes.INT32: 2,
+        ossisTypes.UINT32: 2,
+        ossisTypes.INT64: 2,
+        ossisTypes.UINT64: 2,
+        ossisTypes.DOUBLE: 3,
+        ossisTypes.FLOAT16: 3,
+        ossisTypes.FLOAT32: 3,
+        ossisTypes.FLOAT64: 3,
+        ossisTypes.DECIMAL: 4,
         # Temporal promotion
-        OrsoTypes.DATE: 1,
-        OrsoTypes.TIMESTAMP: 2,
+        ossisTypes.DATE: 1,
+        ossisTypes.TIMESTAMP: 2,
         # String/binary promotion
-        OrsoTypes.BLOB: 1,
-        OrsoTypes.VARCHAR: 2,
+        ossisTypes.BLOB: 1,
+        ossisTypes.VARBINARY: 1,
+        ossisTypes.VARCHAR: 2,
     }
 
     # First check if all types are in the same category
@@ -433,11 +710,19 @@ def find_compatible_type(types: Iterable[OrsoTypes], default=OrsoTypes.VARCHAR) 
     if all(t.is_large_object() for t in types):
         return max(types, key=lambda t: type_hierarchy.get(t, 0))
     if all(
-        t in (OrsoTypes.BLOB, OrsoTypes.STRUCT, OrsoTypes.JSONB, OrsoTypes.VARCHAR) for t in types
+        t
+        in (
+            ossisTypes.BLOB,
+            ossisTypes.VARBINARY,
+            ossisTypes.STRUCT,
+            ossisTypes.JSONB,
+            ossisTypes.VARCHAR,
+        )
+        for t in types
     ):
-        return OrsoTypes.BLOB
+        return ossisTypes.VARBINARY
 
     # For heterogeneous types, default to the most flexible type
-    if any(t == OrsoTypes.BLOB for t in types):
-        return OrsoTypes.BLOB
+    if any(t in (ossisTypes.BLOB, ossisTypes.VARBINARY) for t in types):
+        return ossisTypes.VARBINARY
     return default

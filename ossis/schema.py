@@ -11,23 +11,44 @@
 # limitations under the License.
 
 """
-Column and Schema Classes
+Column Classes
 
-This module defines column and schema types for data validation and manipulation.
-It provides a common interface for working with structured data across different
-data processing engines.
-
-The main classes are:
-    - FlatColumn: Represents a column definition with type, constraints, and metadata
-    - RelationSchema: Represents a collection of columns forming a table/relation schema
-    - ColumnDisposition: Enum for column usage patterns (e.g., name, age columns)
+This module defines several specialized column types, aimed at providing efficient
+memory usage and computational speed for various SQL queries. The column types differ
+in their internal data representation but expose a common interface for manipulation
+and query operations.
 
 Features:
-    - Type validation and parsing
-    - Schema validation against data records
-    - PyArrow integration for data interchange
-    - JSON serialization/deserialization
-    - Column aliasing and identification
+    - All column types (except FlatColumn & FunctionColumn) use compressed internal
+      representations to conserve memory.
+    - The compressed data is exposed through a 'values' property. This allows direct
+      operations on compressed data, which usually involves fewer items compared to the
+      uncompressed list.
+    - Each column type provides a 'materialize' method to expand the compressed data
+      into its uncompressed form, facilitating query operations that require a full
+      column of data.
+
+Column Types:
+    - SparseColumn: Handles sparse data by only storing non-default values.
+    - DictionaryColumn: Uses a dictionary to encode a finite set of string or
+      numerical values.
+    - RLEColumn: Utilizes Run-Length Encoding for sequences of repeating elements.
+    - ConstantColumn: Represents a column of constant values using a single value and a
+      length attribute.
+    - FlatColumn: Standard column type that stores data in an uncompressed form.
+    - FunctionColumn: Used when the column is the result of a function, useful as a
+      placeholder column type.
+
+By leveraging these compressed representations, ossis aims to provide a data store that
+is both memory-efficient and computationally fast. For most operations, manipulating
+the compressed data directly, bypassing the need to materialize the full column,
+leading to faster evaluation.
+
+Example:
+    sparse_col = SparseColumn(name='col1', type=ossisTypes.INTEGER, values=[1, None, 3])
+    sparse_col.values *= 2  # Perform operation directly on compressed data
+    full_array = sparse_col.materialize()  # Get the full, uncompressed array when needed
+
 """
 
 from collections import defaultdict
@@ -39,10 +60,13 @@ from dataclasses import fields
 from decimal import getcontext
 from enum import Enum
 from typing import Any
+from typing import Callable
 from typing import Dict
+from typing import FrozenSet
 from typing import List
 from typing import MutableMapping
 from typing import Optional
+from typing import Tuple
 from typing import Type
 from typing import Union
 from warnings import warn
@@ -51,14 +75,14 @@ import numpy
 import orjson
 from data_expectations import Expectation
 
-from .exceptions import ColumnDefinitionError
-from .exceptions import DataValidationError
-from .exceptions import ExcessColumnsInDataError
-from .tools import arrow_type_map
-from .tools import random_string
-from .types import ORSO_TO_PYTHON_MAP
-from .types import PYTHON_TO_ORSO_MAP
-from .types import OrsoTypes
+from ossis.exceptions import ColumnDefinitionError
+from ossis.exceptions import DataValidationError
+from ossis.exceptions import ExcessColumnsInDataError
+from ossis.tools import arrow_type_map
+from ossis.tools import random_string
+from ossis.types import ossis_TO_PYTHON_MAP
+from ossis.types import PYTHON_TO_ossis_MAP
+from ossis.types import ossisTypes
 
 _MISSING_VALUE: str = str()
 DECIMAL_PRECISION: int = getcontext().prec
@@ -103,29 +127,29 @@ class SchemaExpectation(Expectation):
 @dataclass(init=False)
 class FlatColumn:
     """
-    Represents a column definition with type information, constraints, and metadata.
-    
-    This is the primary column type for schema definitions. It stores metadata
-    about a column including its name, data type, nullability, and validation rules.
+    This is a standard column type.
+    Unlike the other column types, we don't store the values for this Column
+    here, we read them from the underlying data structure (ossis/pyarrow/velox).
     """
 
     name: str
     default: Optional[Any] = None
-    type: OrsoTypes = OrsoTypes._MISSING_TYPE
-    element_type: Optional[OrsoTypes] = None
+    type: ossisTypes = ossisTypes._MISSING_TYPE
+    element_type: Optional[ossisTypes] = None
     description: Optional[str] = None
     disposition: Optional[ColumnDisposition] = None
     aliases: Optional[List[str]] = field(default_factory=list)  # type: ignore
     nullable: bool = True
-    expectations: Optional[List[Expectation]] = field(default_factory=list)  # type: ignore
+    expectations: Optional[Expectation] = field(default_factory=list)
     identity: str = field(default_factory=random_string)
     length: Optional[int] = None
     precision: Optional[int] = None
     scale: Optional[int] = None
-    origin: Optional[List[str]] = field(default_factory=list)  # type: ignore
+    origin: Optional[List[str]] = field(default_factory=list)
     highest_value: Optional[Any] = None
     lowest_value: Optional[Any] = None
     null_count: Optional[int] = None
+    fields: Optional[List["FlatColumn"]] = None
 
     def __init__(self, **kwargs):
         attributes = {f.name: f for f in fields(self.__class__)}
@@ -146,6 +170,8 @@ class FlatColumn:
                         )
                         for v in value
                     ]
+                if attribute == "fields" and value:
+                    value = [v if isinstance(v, FlatColumn) else FlatColumn(**v) for v in value]
 
                 setattr(self, attribute, value)
             elif not isinstance(attributes[attribute].default, _MISSING_TYPE):
@@ -155,12 +181,12 @@ class FlatColumn:
             else:
                 raise ColumnDefinitionError(attribute)
 
-        # map literals to OrsoTypes
-        if self.type.__class__ is not OrsoTypes:
-            self.type, _length, _precision, _scale, _element_type = OrsoTypes.from_name(self.type)
-            if self.type == OrsoTypes._MISSING_TYPE:
+        # map literals to ossisTypes
+        if self.type.__class__ is not ossisTypes:
+            self.type, _length, _precision, _scale, _element_type = ossisTypes.from_name(self.type)
+            if self.type == ossisTypes._MISSING_TYPE:
                 warn(f"Column '{self.name}' type not recognized.")
-            if isinstance(self.type, OrsoTypes):
+            if isinstance(self.type, ossisTypes):
                 if self.element_type is None:
                     self.element_type = _element_type
                 if self.precision is None:
@@ -180,53 +206,59 @@ class FlatColumn:
                 )
 
         # validate decimal properties
-        if self.type == OrsoTypes.DECIMAL and self.precision is None:
+        if self.type == ossisTypes.DECIMAL and self.precision is None:
             from decimal import getcontext
 
             self.precision = getcontext().prec
-        if self.type == OrsoTypes.DECIMAL and self.scale is None:
+        if self.type == ossisTypes.DECIMAL and self.scale is None:
             self.scale = int(0.75 * self.precision)
 
     def __str__(self):
         return self.identity
 
+    def materialize(self):
+        raise TypeError("Cannot materialize FlatColumns")
+
     @classmethod
     def from_arrow(cls, arrow_field, mappable_as_binary: bool = False) -> "FlatColumn":
         """
-        Converts a PyArrow field to an Orso FlatColumn object.
+        Converts a PyArrow field to an ossis FlatColumn object.
 
         Parameters:
             arrow_field: Field
                 PyArrow Field object to be converted.
-            mappable_as_binary: bool
-                Whether complex types should be mapped as binary
 
         Returns:
             FlatColumn: A FlatColumn object containing the converted information.
         """
-        from .tools import DecimalFactory
+        from ossis.tools import DecimalFactory
 
         # Fetch the native type mapping from Arrow to Python native types
         native_type = arrow_type_map(arrow_field.type)
         element_type = None
+        struct_fields: Optional[List["FlatColumn"]] = None
         # Initialize variables to hold optional decimal properties
         scale: Optional[int] = None
         precision: Optional[int] = None
         # Check if the type is Decimal and populate scale and precision
         if isinstance(native_type, DecimalFactory):
-            field_type = OrsoTypes.DECIMAL
+            field_type = ossisTypes.DECIMAL
             scale = native_type.scale  # type:ignore
             precision = native_type.precision  # type:ignore
         elif mappable_as_binary and native_type == dict:
-            field_type = OrsoTypes.BLOB
+            field_type = ossisTypes.BLOB
+        elif native_type == dict:
+            field_type = ossisTypes.STRUCT
+            if getattr(arrow_field.type, "num_fields", 0):
+                struct_fields = [cls.from_arrow(child) for child in arrow_field.type]
         elif native_type == list:
-            field_type = OrsoTypes.ARRAY
-            element_type = PYTHON_TO_ORSO_MAP.get(arrow_type_map(arrow_field.type.value_type))
+            field_type = ossisTypes.ARRAY
+            element_type = PYTHON_TO_ossis_MAP.get(arrow_type_map(arrow_field.type.value_type))
         else:
             # Fall back to the generic mapping
-            field_type = PYTHON_TO_ORSO_MAP.get(native_type, None)
+            field_type = PYTHON_TO_ossis_MAP.get(native_type, None)
             if field_type is None:
-                field_type = OrsoTypes.VARCHAR
+                field_type = ossisTypes.VARCHAR
 
         field_type._element_type = element_type
         field_type._scale = scale
@@ -239,10 +271,10 @@ class FlatColumn:
             nullable=arrow_field.nullable,
             scale=scale,
             precision=precision,
+            fields=struct_fields,
         )
 
     def to_flatcolumn(self) -> "FlatColumn":
-        """Convert to FlatColumn (no-op for FlatColumn itself)"""
         col = object.__new__(FlatColumn)
 
         col.name = str(self.name)
@@ -259,6 +291,11 @@ class FlatColumn:
         col.highest_value = self.highest_value
         col.null_count = self.null_count
         col.origin = self.origin
+        col.fields = (
+            [field.to_flatcolumn() for field in self.fields]
+            if getattr(self, "fields", None)
+            else None
+        )
 
         return col
 
@@ -271,40 +308,23 @@ class FlatColumn:
 
     @property
     def arrow_field(self):
-        """Convert to PyArrow field"""
         import pyarrow
 
-        # fmt: off
-        type_map: dict = {
-            OrsoTypes.BOOLEAN: pyarrow.bool_(),
-            OrsoTypes.BLOB: pyarrow.binary(),
-            OrsoTypes.DATE: pyarrow.date64(),
-            OrsoTypes.TIMESTAMP: pyarrow.timestamp("us"),
-            OrsoTypes.TIME: pyarrow.time32("ms"),
-            OrsoTypes.INTERVAL: pyarrow.month_day_nano_interval(),
-            OrsoTypes.STRUCT: pyarrow.binary(),  # convert structs to JSON strings/BSONs
-            OrsoTypes.DECIMAL: pyarrow.decimal128(self.precision or DECIMAL_PRECISION, self.scale or 10),
-            OrsoTypes.DOUBLE: pyarrow.float64(),
-            OrsoTypes.INTEGER: pyarrow.int64(),
-            OrsoTypes.ARRAY: pyarrow.list_(pyarrow.string()),
-            OrsoTypes.VARCHAR: pyarrow.string(),
-            OrsoTypes.JSONB: pyarrow.binary(),
-            OrsoTypes.NULL: pyarrow.null(),
-        }
-        # fmt: on
+        # Delegate type mapping to ossisTypes.to_arrow which returns a pyarrow DataType.
+        if self.type == ossisTypes.STRUCT:
+            if self.fields:
+                struct_type = pyarrow.struct([field.arrow_field for field in self.fields])
+                return pyarrow.field(name=self.name, type=struct_type, nullable=self.nullable)
+            return pyarrow.field(name=self.name, type=pyarrow.binary(), nullable=self.nullable)
 
-        if self.type == OrsoTypes.ARRAY:
-            return pyarrow.field(
-                name=self.name,
-                type=pyarrow.list_(type_map.get(self.element_type, pyarrow.string())),
-            )
-
-        return pyarrow.field(name=self.name, type=type_map.get(self.type, pyarrow.string()))
+        arrow_type = self.type.to_arrow(
+            element_type=self.element_type, precision=self.precision, scale=self.scale
+        )
+        return pyarrow.field(name=self.name, type=arrow_type, nullable=self.nullable)
 
     def to_json(self) -> str:
-        """Serialize column to JSON"""
         def default_serializer(o):
-            if isinstance(o, OrsoTypes):
+            if isinstance(o, ossisTypes):
                 return str(o)
             if isinstance(o, Expectation):
                 return o.__dict__
@@ -314,30 +334,161 @@ class FlatColumn:
 
     @classmethod
     def from_json(cls, json_str: str) -> "FlatColumn":
-        """Deserialize column from JSON"""
-        def custom_decoder(dct):
-            if "type" in dct:
-                dct["type"] = OrsoTypes.__members__.get(dct["type"], OrsoTypes._MISSING_TYPE)
-            if "expectations" in dct and isinstance(dct["expectations"], list):
-                dct["expectations"] = [
-                    SchemaExpectation.load(v) if isinstance(v, dict) else v
-                    for v in dct["expectations"]
-                ]
-            return dct
-
         data = orjson.loads(json_str)
         return cls(**data)
 
 
+@dataclass(init=False)
+class FunctionColumn(FlatColumn):
+    """
+    This is a virtual column, it's nominally a column where the value is
+    derived from a function.
+    """
+
+    binding: Optional[Callable] = lambda: None
+    configuration: Tuple = field(default_factory=tuple)
+    length: int = 1
+
+    @property
+    def values(self):
+        raise TypeError("FunctionColumn has no 'values', do you mean 'materialize'?")
+
+    def materialize(self):
+        """
+        Turn this virtual column into a list
+        """
+        value = self.binding(*self.configuration)
+        return numpy.array([value] * self.length)
+
+
+@dataclass(init=False)
+class ConstantColumn(FlatColumn):
+    """
+    Rather than pass around columns of constant values, where we can we should
+    replace them with this column type.
+
+    Note: We don't implement anything here which deals with doing operations on
+    two constant columns; whilst that would be a good optimization, the better
+    way to do this is in the query optimizer, do operations on two constants
+    while we're still working with a query plan.
+    """
+
+    length: int = 1
+    value: Any = None
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.values = numpy.array([self.value])
+
+    def materialize(self):
+        """
+        Turn this virtual column into a list.
+        When performing element-wise operations, use value_array for broadcasting.
+        """
+        return numpy.full(self.length, self.values)
+
+
+@dataclass(init=False)
+class SparseColumn(FlatColumn):
+    """
+    This is a column type optimized for sparse data.
+    Only the non-default values and their indices are stored.
+    """
+
+    values: numpy.ndarray = None
+    default_value: Any = None
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        (self.indices,) = numpy.where(numpy.array(self.values) != self.default_value)
+        self.values = numpy.array(self.values)[self.indices]
+        self.total_length = len(kwargs.get("values", []))  # Store the total length
+
+    def materialize(self):
+        """
+        Materialize the sparse column into a full numpy array.
+        """
+        materialized = numpy.full(
+            self.total_length, self.default_value
+        )  # Initialize with default values
+        materialized[self.indices] = self.values
+        return materialized
+
+
+@dataclass(init=False)
+class RLEColumn(FlatColumn):
+    """
+    This is a column type optimized for sequences of repeated values.
+    """
+
+    values: numpy.ndarray = None
+    lengths: List[int] = field(default_factory=list)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        run_values = []
+        run_lengths = []
+
+        if len(self.values) == 0:
+            self.values = numpy.array([])
+            return
+
+        prev_value = self.values[0]
+        run_length = 1
+
+        for value in self.values[1:]:
+            if value == prev_value:
+                run_length += 1
+            else:
+                run_values.append(prev_value)
+                run_lengths.append(run_length)
+
+                prev_value = value
+                run_length = 1
+
+        run_values.append(prev_value)
+        run_lengths.append(run_length)
+
+        self.values = numpy.array(run_values)
+        self.lengths = run_lengths
+
+    def materialize(self):
+        """
+        Turn this compressed column back into its original form.
+        """
+        materialized = []
+        for value, length in zip(self.values, self.lengths):
+            materialized.extend([value] * length)
+        return numpy.array(materialized)
+
+
+@dataclass(init=False)
+class DictionaryColumn(FlatColumn):
+    """
+    If we know a column has a small amount of unique values AND is a large column
+    AND we're going to perform an operation on the values, we should dictionary
+    encode the column. This allows us to operate once on each unique value in the
+    column, rather than each value in the column individually. At the cost of
+    constructing and materializing the dictionary encoding.
+    """
+
+    values: List[Any] = field(default_factory=list)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        values = numpy.asarray(self.values)
+        self.values, self.encoding = numpy.unique(values, return_inverse=True)
+
+    def materialize(self):
+        """
+        Turn this virtual column into a list
+        """
+        return self.values[self.encoding]
+
+
 @dataclass
 class RelationSchema:
-    """
-    Represents a collection of columns forming a table/relation schema.
-    
-    This class manages a set of column definitions and provides methods for
-    schema validation, manipulation, and serialization.
-    """
-    
     name: str
     aliases: List[str] = field(default_factory=list)
     columns: List[FlatColumn] = field(default_factory=list)
@@ -351,6 +502,55 @@ class RelationSchema:
     """Statistic of the size of the data in the relation."""
     data_size_estimate: Optional[int] = None
     """Estimate of the size of the data in the relation."""
+
+    _column_snapshot: Tuple[Tuple[str, str, bool, ossisTypes], ...] = field(
+        init=False, repr=False, compare=False, default_factory=tuple
+    )
+    _column_name_set: FrozenSet[str] = field(
+        init=False, repr=False, compare=False, default_factory=frozenset
+    )
+    _column_order: Tuple[str, ...] = field(
+        init=False, repr=False, compare=False, default_factory=tuple
+    )
+    _non_nullable_columns: FrozenSet[str] = field(
+        init=False, repr=False, compare=False, default_factory=frozenset
+    )
+    _python_type_map: Dict[str, Tuple[type, ...]] = field(
+        init=False, repr=False, compare=False, default_factory=dict
+    )
+    _column_by_name: Dict[str, FlatColumn] = field(
+        init=False, repr=False, compare=False, default_factory=dict
+    )
+
+    def __post_init__(self):
+        self._rebuild_cache()
+
+    def _rebuild_cache(self) -> None:
+        column_snapshot = tuple(
+            (column.identity, column.name, column.nullable, column.type) for column in self.columns
+        )
+        self._column_snapshot = column_snapshot
+        self._column_order = tuple(column.name for column in self.columns)
+        self._column_name_set = frozenset(self._column_order)
+        self._column_by_name = {column.name: column for column in self.columns}
+        self._non_nullable_columns = frozenset(
+            column.name for column in self.columns if not column.nullable
+        )
+
+        python_type_map: Dict[str, Tuple[type, ...]] = {}
+        for column in self.columns:
+            if column.type != ossisTypes._MISSING_TYPE:
+                python_types = ossis_TO_PYTHON_MAP.get(column.type)
+                if python_types is not None:
+                    python_type_map[column.name] = python_types
+        self._python_type_map = python_type_map
+
+    def _ensure_cache(self) -> None:
+        column_snapshot = tuple(
+            (column.identity, column.name, column.nullable, column.type) for column in self.columns
+        )
+        if column_snapshot != self._column_snapshot:
+            self._rebuild_cache()
 
     def __iter__(self):
         """Return an iterator over column names."""
@@ -382,6 +582,7 @@ class RelationSchema:
 
         # Assign the new list of columns to the new schema
         new_schema.columns = new_columns
+        new_schema._rebuild_cache()
 
         return new_schema
 
@@ -397,8 +598,6 @@ class RelationSchema:
         Parameters:
             column_name: str
                 Name or alias of the column.
-            case_insensitive: bool
-                Whether to perform case-insensitive matching
 
         Returns:
             Optional[FlatColumn]: The FlatColumn object, if found. None otherwise.
@@ -461,7 +660,9 @@ class RelationSchema:
         """
         for idx, column in enumerate(self.columns):
             if column.name == column_name:
-                return self.columns.pop(idx)
+                removed = self.columns.pop(idx)
+                self._rebuild_cache()
+                return removed
         return None
 
     def to_dict(self) -> Dict:
@@ -516,8 +717,10 @@ class RelationSchema:
         if not isinstance(data, MutableMapping):
             raise TypeError("Cannot validate non Dictionary-type value")
 
+        self._ensure_cache()
+
         # Check if all fields in 'data' are in the schema
-        extra_fields = set(data.keys()) - set(column.name for column in self.columns)
+        extra_fields = set(data.keys()) - self._column_name_set
         if extra_fields:
             raise ExcessColumnsInDataError(columns=extra_fields)
 
@@ -531,25 +734,26 @@ class RelationSchema:
                 value = data[column.name]
 
                 if value is None:
-                    if not column.nullable:
+                    if column.name in self._non_nullable_columns:
                         errors["Column not Nullable"].append(column.name)
-                elif column.type != OrsoTypes._MISSING_TYPE and not isinstance(
-                    value, ORSO_TO_PYTHON_MAP[column.type]
-                ):
-                    errors["Incorrect Type"].append(
-                        (
-                            column.name,
-                            value,
-                            column.type,
+                else:
+                    expected_types = self._python_type_map.get(column.name)
+                    if expected_types is None:
+                        continue
+                    if not isinstance(value, expected_types):
+                        errors["Incorrect Type"].append(
+                            (
+                                column.name,
+                                value,
+                                column.type,
+                            )
                         )
-                    )
 
         if errors:
             raise DataValidationError(errors=errors)
         return True
 
     def to_json(self):
-        """Serialize schema to JSON"""
         return {
             "name": self.name,
             "aliases": self.aliases,
@@ -558,22 +762,23 @@ class RelationSchema:
         }
 
 
-def convert_arrow_schema_to_orso_schema(arrow_schema):
-    """Convert PyArrow schema to Orso RelationSchema"""
+def convert_arrow_schema_to_ossis_schema(arrow_schema):
     return RelationSchema(
         name="arrow",
         columns=[FlatColumn.from_arrow(field) for field in arrow_schema],
     )
 
 
-def convert_orso_schema_to_arrow_schema(orso_schema, use_identities: bool = False):
-    """Convert Orso RelationSchema to PyArrow schema"""
+def convert_ossis_schema_to_arrow_schema(ossis_schema, use_identities: bool = False):
     from pyarrow import field
     from pyarrow import schema
 
     if not use_identities:
-        return schema([col.arrow_field for col in orso_schema.columns])
+        return schema([col.arrow_field for col in ossis_schema.columns])
 
     return schema(
-        [field(name=col.identity, type=col.arrow_field.type) for col in orso_schema.columns]
+        [
+            field(name=col.identity, type=col.arrow_field.type, nullable=col.arrow_field.nullable)
+            for col in ossis_schema.columns
+        ]
     )

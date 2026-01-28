@@ -1,0 +1,59 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+ossis Compute Module
+
+High-performance compiled implementations for column operations.
+"""
+
+# Import compiled functions
+from ossis.compute.compiled import calculate_data_width
+from ossis.compute.compiled import collect_cython
+from ossis.compute.compiled import extract_dict_columns
+from ossis.compute.compiled import from_bytes_cython
+from ossis.compute.compiled import process_table
+from ossis.compute.compiled import parse_float16
+from ossis.compute.compiled import parse_float32
+from ossis.compute.compiled import parse_float64
+
+__all__ = [
+    # From compiled module
+    "from_bytes_cython",
+    "extract_dict_columns",
+    "collect_cython",
+    "calculate_data_width",
+    "process_table",
+    "parse_float16",
+    "parse_float32",
+    "parse_float64",
+]
+
+# Import column encoding functions if available
+# These require the Cython extension to be built
+try:
+    from ossis.compute.column_encodings import dict_decode
+    from ossis.compute.column_encodings import dict_encode
+    from ossis.compute.column_encodings import rle_decode
+    from ossis.compute.column_encodings import rle_encode
+
+    __all__.extend(
+        [
+            "rle_encode",
+            "rle_decode",
+            "dict_encode",
+            "dict_decode",
+        ]
+    )
+except ImportError:
+    # Column encodings not available - extension not built
+    pass
