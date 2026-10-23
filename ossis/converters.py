@@ -152,7 +152,7 @@ def from_arrow(tables, size=None):
     )
     row_factory = Row.create_class(ossis_schema, tuples_only=True)
 
-    # Create an bespoke lazy iterator instance
+    # Create a bespoke lazy iterator instance
     rows_iterator = _RowsIterator(
         tables=itertools.chain([first_table], tables),
         row_factory=row_factory,
