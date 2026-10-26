@@ -54,7 +54,7 @@ def add_logging_level(level_name, level_num, method_name=None):
     # http://stackoverflow.com/q/2183233/2988730, especially
     # http://stackoverflow.com/a/13638084/2988730
     def log_for_level(self, message, *args, **kwargs):
-        # if we've added the level,it doesn't format the message as JSON
+        # if we've added the level, it doesn't format the message as JSON
         if isinstance(message, dict):
             try:
                 message = orjson.dumps(message)
@@ -64,7 +64,7 @@ def add_logging_level(level_name, level_num, method_name=None):
         if isinstance(message, bytes):
             message = message.decode()
         if self.isEnabledFor(level_num):
-            # supress duplicate warnings
+            # suppress duplicate warnings
             if level_num == 30:  # warnings
                 hashed = hash(message)
                 if hashed in logging_seen_warnings:

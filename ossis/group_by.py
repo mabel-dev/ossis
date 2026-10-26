@@ -53,7 +53,7 @@ class GroupBy:
     """
     GroupBy does a lazy evaluation of the groups, the groups are calculated as part of
     calculating the aggregations. This was implemented like this so that generators
-    can be aggregated - we have one opportunity to cycle of the records, and if the
+    can be aggregated - we have one opportunity to cycle over the records, and if the
     data is in a generator, there's a chance the dataset doesn't fit in memory.
     """
 
